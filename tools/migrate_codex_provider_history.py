@@ -402,8 +402,11 @@ def migrate_sqlite(
         if apply and report.rows_needing_update > 0:
             backup_sqlite_bundle(db_path, backup_root)
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(f"UPDATE threads SET model_provider = ? WHERE {where_clause}", [target_provider, *params])
-            report.rows_updated = connection.total_changes
+            cursor = connection.execute(
+                f"UPDATE threads SET model_provider = ? WHERE {where_clause}",
+                [target_provider, *params],
+            )
+            report.rows_updated = cursor.rowcount if cursor.rowcount != -1 else 0
             connection.commit()
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
