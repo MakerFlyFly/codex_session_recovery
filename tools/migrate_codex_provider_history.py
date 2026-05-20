@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +32,7 @@ class RolloutReport:
     session_meta_rewritten: int = 0
     provider_counts_before: Counter[str] = field(default_factory=Counter)
     provider_counts_after: Counter[str] = field(default_factory=Counter)
+    matched_session_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -38,6 +43,10 @@ class SqliteReport:
     rows_updated: int = 0
     provider_counts_before: list[tuple[str | None, int]] = field(default_factory=list)
     provider_counts_after: list[tuple[str | None, int]] = field(default_factory=list)
+
+
+SESSION_META_PATTERN = re.compile(r'"type"\s*:\s*"session_meta"')
+TOP_LEVEL_STRING_PATTERN = re.compile(r"""^([A-Za-z0-9_]+)\s*=\s*(['"])(.*?)\2\s*(?:#.*)?$""")
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write changes. Without this flag the script runs in dry-run mode.",
     )
+    parser.add_argument(
+        "--allow-live-codex",
+        action="store_true",
+        help="Allow apply while a live Codex process appears to be running.",
+    )
     return parser.parse_args()
 
 
@@ -107,48 +121,91 @@ def inspect_config(config_path: Path) -> ConfigStatus:
     status = ConfigStatus(path=config_path)
     if not config_path.exists():
         return status
-    current_section: str | None = None
-    scalar_pattern = re.compile(r'^([A-Za-z0-9_]+)\s*=\s*"([^"]*)"\s*$')
+    parser_status = inspect_config_with_parser(config_path)
+    if parser_status is not None:
+        return parser_status
 
-    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+    current_section: str | None = None
+    config_text = config_path.read_text(encoding="utf-8-sig")
+    for raw_line in config_text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]"):
             current_section = line[1:-1].strip()
             continue
-        match = scalar_pattern.match(line)
+        match = TOP_LEVEL_STRING_PATTERN.match(line)
         if not match or current_section is not None:
             continue
-        key, value = match.groups()
+        key, _, value = match.groups()
         if key == "model_provider" and value.strip():
             status.active_provider = value.strip()
         elif key == "sqlite_home" and value.strip():
-            status.sqlite_home = Path(value.strip()).expanduser()
+            sqlite_home = Path(value.strip()).expanduser()
+            if not sqlite_home.is_absolute():
+                sqlite_home = (config_path.parent / sqlite_home).resolve()
+            status.sqlite_home = sqlite_home
     return status
+
+
+def inspect_config_with_parser(config_path: Path) -> ConfigStatus | None:
+    try:
+        import tomllib  # type: ignore[attr-defined]
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            return None
+
+    status = ConfigStatus(path=config_path)
+    data = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    provider = data.get("model_provider")
+    if isinstance(provider, str) and provider.strip():
+        status.active_provider = provider.strip()
+    sqlite_home = data.get("sqlite_home")
+    if isinstance(sqlite_home, str) and sqlite_home.strip():
+        sqlite_path = Path(sqlite_home).expanduser()
+        if not sqlite_path.is_absolute():
+            sqlite_path = (config_path.parent / sqlite_path).resolve()
+        status.sqlite_home = sqlite_path
+    return status
+
+
+def resolve_sqlite_home_env(codex_home: Path) -> Path | None:
+    raw = os.environ.get("CODEX_SQLITE_HOME")
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    path = Path(trimmed).expanduser()
+    if path.is_absolute():
+        return path
+    return (codex_home / path).resolve()
 
 
 def resolve_state_db(codex_home: Path, config_status: ConfigStatus, explicit_path: Path | None) -> Path | None:
     if explicit_path is not None:
         return explicit_path.expanduser().resolve()
     search_roots: list[Path] = []
-    for root in (config_status.sqlite_home, codex_home):
+    for root in (config_status.sqlite_home, resolve_sqlite_home_env(codex_home), codex_home):
         if root is not None and root not in search_roots:
             search_roots.append(root)
-    candidates: list[tuple[int, float, Path]] = []
     for root in search_roots:
         if not root.exists():
             continue
+        candidates: list[tuple[int, float, Path]] = []
         for path in root.glob("state_*.sqlite"):
             try:
                 version = int(path.stem.split("_", 1)[1])
             except (IndexError, ValueError):
                 continue
             candidates.append((version, path.stat().st_mtime, path))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return candidates[0][2]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][2]
+    return None
 
 
 def iter_rollout_files(codex_home: Path) -> list[Path]:
@@ -167,13 +224,66 @@ def ensure_backup_root(path: Path | None) -> Path | None:
     return path
 
 
+def prepare_backup_root(path: Path | None, apply: bool) -> tuple[Path | None, bool]:
+    if path is not None:
+        root = path.expanduser().resolve()
+        if not apply:
+            return root, False
+        root = root / f"run-{next(tempfile._get_candidate_names())}"
+        return ensure_backup_root(root), False
+    if not apply:
+        return None, False
+    temporary = Path(tempfile.mkdtemp(prefix="codex-provider-history-", dir=str(Path.cwd())))
+    return ensure_backup_root(temporary), True
+
+
+def validate_rollout_jsonl(path: Path) -> None:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if payload.get("type") != "session_meta":
+                raise ValueError(f"Backup file does not start with session_meta: {path}")
+            return
+    raise ValueError(f"Backup file is empty: {path}")
+
+
+def validate_sqlite_snapshot(path: Path) -> None:
+    connection = sqlite3.connect(str(path))
+    try:
+        result = connection.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            raise ValueError(f"SQLite backup failed integrity check: {path}")
+    finally:
+        connection.close()
+
+
 def backup_rollout_file(src: Path, codex_home: Path, backup_root: Path | None) -> None:
     if backup_root is None:
         return
     destination = backup_root / src.relative_to(codex_home)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
-        shutil.copy2(src, destination)
+        temp_path = destination.with_name(f"{destination.name}.backup-{next(tempfile._get_candidate_names())}")
+        try:
+            shutil.copy2(src, temp_path)
+            validate_rollout_jsonl(temp_path)
+            os.replace(temp_path, destination)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp-{next(tempfile._get_candidate_names())}")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def backup_sqlite_bundle(db_path: Path, backup_root: Path | None) -> None:
@@ -181,12 +291,113 @@ def backup_sqlite_bundle(db_path: Path, backup_root: Path | None) -> None:
         return
     sqlite_root = backup_root / "sqlite"
     sqlite_root.mkdir(parents=True, exist_ok=True)
-    for suffix in ("", "-wal", "-shm"):
+    destination = sqlite_root / db_path.name
+    if destination.exists():
+        return
+
+    temp_path = destination.with_name(f"{destination.name}.backup-{next(tempfile._get_candidate_names())}")
+    source = sqlite3.connect(str(db_path))
+    try:
+        target = sqlite3.connect(str(temp_path))
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+        validate_sqlite_snapshot(temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        source.close()
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def restore_rollout_backups(codex_home: Path, backup_root: Path | None) -> None:
+    if backup_root is None or not backup_root.exists():
+        return
+    for relative_dir in ("sessions", "archived_sessions"):
+        source_root = backup_root / relative_dir
+        if not source_root.exists():
+            continue
+        for src in source_root.rglob("*.jsonl"):
+            destination = codex_home / src.relative_to(backup_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = destination.with_name(f"{destination.name}.restore-{next(tempfile._get_candidate_names())}")
+            try:
+                validate_rollout_jsonl(src)
+                shutil.copy2(src, temp_path)
+                os.replace(temp_path, destination)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+
+
+def restore_sqlite_backup(db_path: Path | None, backup_root: Path | None) -> None:
+    if db_path is None or backup_root is None:
+        return
+    source = backup_root / "sqlite" / db_path.name
+    if not source.exists():
+        return
+
+    temp_path = db_path.with_name(f"{db_path.name}.restore-{next(tempfile._get_candidate_names())}")
+    try:
+        validate_sqlite_snapshot(source)
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, db_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    for suffix in ("-wal", "-shm"):
         current = Path(str(db_path) + suffix)
         if current.exists():
-            destination = sqlite_root / current.name
-            if not destination.exists():
-                shutil.copy2(current, destination)
+            current.unlink()
+
+
+def rollback_migration(codex_home: Path, state_db_path: Path | None, backup_root: Path | None) -> list[str]:
+    errors: list[str] = []
+    try:
+        restore_rollout_backups(codex_home, backup_root)
+    except BaseException as exc:  # pragma: no cover - defensive rollback reporting
+        errors.append(f"rollout restore failed: {exc}")
+    try:
+        restore_sqlite_backup(state_db_path, backup_root)
+    except BaseException as exc:  # pragma: no cover - defensive rollback reporting
+        errors.append(f"sqlite restore failed: {exc}")
+    return errors
+
+
+def detect_live_codex_processes() -> list[str]:
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/fo", "csv", "/nh"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            processes: list[str] = []
+            for row in csv.reader(result.stdout.splitlines()):
+                if not row:
+                    continue
+                image_name = row[0].strip()
+                if "codex" in image_name.lower():
+                    processes.append(image_name)
+            return sorted(set(processes))
+
+        result = subprocess.run(
+            ["ps", "-A", "-o", "comm="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        processes = []
+        for line in result.stdout.splitlines():
+            image_name = line.strip()
+            if "codex" in image_name.lower():
+                processes.append(image_name)
+        return sorted(set(processes))
+    except OSError:
+        return []
 
 
 def should_migrate(
@@ -218,13 +429,13 @@ def rewrite_rollout_file(
     replacements: dict[int, str] = {}
     file_changed = False
 
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8-sig") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.rstrip("\n")
             if not line.strip():
                 continue
 
-            if '"type":"session_meta"' not in line and '"type": "session_meta"' not in line:
+            if not SESSION_META_PATTERN.search(line):
                 continue
 
             try:
@@ -240,10 +451,13 @@ def rewrite_rollout_file(
             if not isinstance(session_meta, dict):
                 raise ValueError(f"session_meta payload is not an object at {path}:{line_number}")
             session_id = session_meta.get("id")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError(f"session_meta is missing a non-empty id at {path}:{line_number}")
             if session_ids is not None and session_id not in session_ids:
                 break
 
             report.session_meta_matched += 1
+            report.matched_session_ids.add(session_id)
             provider_value = session_meta.get("model_provider")
             provider_key = provider_value if isinstance(provider_value, str) and provider_value else "<missing>"
             report.provider_counts_before[provider_key] += 1
@@ -268,7 +482,7 @@ def rewrite_rollout_file(
     if not apply:
         return
 
-    original_text = path.read_text(encoding="utf-8")
+    original_text = path.read_text(encoding="utf-8-sig")
     newline_at_end = original_text.endswith("\n")
     rewritten_lines = []
     for line_number, line in enumerate(original_text.splitlines(), start=1):
@@ -278,7 +492,7 @@ def rewrite_rollout_file(
     rewritten_text = "\n".join(rewritten_lines)
     if newline_at_end:
         rewritten_text += "\n"
-    path.write_text(rewritten_text, encoding="utf-8")
+    write_text_atomic(path, rewritten_text)
     report.files_updated += 1
 
 
@@ -320,25 +534,39 @@ def fetch_sqlite_provider_counts(
     return [(provider, int(count)) for provider, count in rows]
 
 
+def fetch_existing_thread_ids(db_path: Path | None, session_ids: set[str]) -> set[str]:
+    if db_path is None or not db_path.exists() or not session_ids:
+        return set()
+    connection = sqlite3.connect(str(db_path))
+    try:
+        placeholders = ", ".join("?" for _ in sorted(session_ids))
+        rows = connection.execute(f"SELECT id FROM threads WHERE id IN ({placeholders})", sorted(session_ids)).fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+    finally:
+        connection.close()
+
+
 def build_where_clause(
     target_provider: str,
     source_providers: set[str] | None,
     keep_providers: set[str],
     session_ids: set[str] | None,
 ) -> tuple[str, list[str]]:
-    clauses = ["model_provider IS NOT NULL", "model_provider != ?"]
+    clauses = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
     params: list[str] = [target_provider]
 
     if source_providers:
         placeholders = ", ".join("?" for _ in sorted(source_providers))
         clauses.append(f"model_provider IN ({placeholders})")
         params.extend(sorted(source_providers))
-    elif keep_providers:
+    if keep_providers:
         placeholders = ", ".join("?" for _ in sorted(keep_providers))
         clauses.append(f"model_provider NOT IN ({placeholders})")
         params.extend(sorted(keep_providers))
 
-    if session_ids:
+    if session_ids is not None and not session_ids:
+        clauses.append("1 = 0")
+    elif session_ids:
         placeholders = ", ".join("?" for _ in sorted(session_ids))
         clauses.append(f"id IN ({placeholders})")
         params.extend(sorted(session_ids))
@@ -389,6 +617,8 @@ def migrate_sqlite(
 ) -> SqliteReport:
     report = SqliteReport(path=db_path)
     if db_path is None or not db_path.exists():
+        if apply:
+            raise FileNotFoundError("State DB not found. Refusing to apply a rollout-only migration.")
         return report
 
     connection = sqlite3.connect(db_path)
@@ -498,31 +728,65 @@ def main() -> int:
     target_provider = args.target_provider or config_status.active_provider
     if not target_provider:
         raise SystemExit("Could not determine target provider. Pass --target-provider explicitly.")
+    state_db_path = resolve_state_db(codex_home, config_status, args.state_db)
+    if args.apply and (state_db_path is None or not state_db_path.exists()):
+        raise SystemExit("State DB not found. Refusing to apply because rollout and sqlite history must stay aligned.")
+    if args.apply and not args.allow_live_codex:
+        live_codex_processes = detect_live_codex_processes()
+        if live_codex_processes:
+            joined = ", ".join(live_codex_processes)
+            raise SystemExit(
+                "Live Codex process detected. Close Codex before --apply, "
+                f"or re-run with --allow-live-codex if you accept the risk: {joined}"
+            )
 
-    backup_root = ensure_backup_root(args.backup_dir.expanduser().resolve() if args.backup_dir else None)
+    backup_root, cleanup_backup_root = prepare_backup_root(args.backup_dir, args.apply)
     source_providers = set(args.source_provider) if args.source_provider else None
     keep_providers = set(args.keep_provider or [])
     keep_providers.add(target_provider)
     session_ids = set(args.session_id) if args.session_id else None
 
-    rollout_report = migrate_rollouts(
-        codex_home=codex_home,
-        target_provider=target_provider,
-        source_providers=source_providers,
-        keep_providers=keep_providers,
-        session_ids=session_ids,
-        apply=args.apply,
-        backup_root=backup_root,
-    )
-    sqlite_report = migrate_sqlite(
-        db_path=resolve_state_db(codex_home, config_status, args.state_db),
-        target_provider=target_provider,
-        source_providers=source_providers,
-        keep_providers=keep_providers,
-        session_ids=session_ids,
-        apply=args.apply,
-        backup_root=backup_root,
-    )
+    success = False
+    try:
+        rollout_report = migrate_rollouts(
+            codex_home=codex_home,
+            target_provider=target_provider,
+            source_providers=source_providers,
+            keep_providers=keep_providers,
+            session_ids=session_ids,
+            apply=args.apply,
+            backup_root=backup_root,
+        )
+        if session_ids is not None:
+            missing_session_ids = set(session_ids) - set(rollout_report.matched_session_ids)
+            if missing_session_ids:
+                missing_label = ", ".join(sorted(missing_session_ids))
+                raise SystemExit(f"Requested --session-id values were not found in rollout history: {missing_label}")
+        sqlite_session_ids = set(rollout_report.matched_session_ids)
+        missing_sqlite_ids = sqlite_session_ids - fetch_existing_thread_ids(state_db_path, sqlite_session_ids)
+        if missing_sqlite_ids:
+            missing_sqlite_label = ", ".join(sorted(missing_sqlite_ids))
+            raise SystemExit(f"Matched rollout sessions are missing from SQLite threads: {missing_sqlite_label}")
+        sqlite_report = migrate_sqlite(
+            db_path=state_db_path,
+            target_provider=target_provider,
+            source_providers=source_providers,
+            keep_providers=keep_providers,
+            session_ids=sqlite_session_ids,
+            apply=args.apply,
+            backup_root=backup_root,
+        )
+        success = True
+    except BaseException:
+        if args.apply:
+            rollback_errors = rollback_migration(codex_home, state_db_path, backup_root)
+            for rollback_error in rollback_errors:
+                print(f"Rollback warning: {rollback_error}", file=sys.stderr)
+        raise
+    finally:
+        if success and cleanup_backup_root and backup_root is not None and backup_root.exists():
+            shutil.rmtree(backup_root, ignore_errors=True)
+    summary_backup_root = backup_root if backup_root is not None and backup_root.exists() else None
 
     print_summary(
         apply=args.apply,
@@ -534,7 +798,7 @@ def main() -> int:
         config_status=config_status,
         rollout_report=rollout_report,
         sqlite_report=sqlite_report,
-        backup_root=backup_root,
+        backup_root=summary_backup_root,
     )
     return 0
 
