@@ -235,7 +235,7 @@ def prepare_backup_root(path: Path | None, apply: bool) -> tuple[Path | None, bo
         return ensure_backup_root(root), False
     if not apply:
         return None, False
-    temporary = Path(tempfile.mkdtemp(prefix="codex-provider-history-", dir=str(Path.cwd())))
+    temporary = Path(tempfile.mkdtemp(prefix="codex-provider-history-"))
     return ensure_backup_root(temporary), True
 
 
@@ -863,6 +863,8 @@ def main() -> int:
             rollback_errors = rollback_migration(codex_home, state_db_path, backup_root)
             for rollback_error in rollback_errors:
                 print(f"Rollback warning: {rollback_error}", file=sys.stderr)
+            if backup_root is not None and backup_root.exists():
+                print(f"Rollback backup retained at: {backup_root}", file=sys.stderr)
         raise
     finally:
         if success and cleanup_backup_root and backup_root is not None and backup_root.exists():

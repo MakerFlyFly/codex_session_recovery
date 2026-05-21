@@ -264,7 +264,7 @@ class MigratorCliTest(unittest.TestCase):
         sqlite_backup.mkdir(parents=True, exist_ok=True)
         (sqlite_backup / live_db.name).write_text("not-a-sqlite-db", encoding="utf-8")
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ValueError, "Backup metadata is missing"):
             self.module.restore_sqlite_backup(live_db, bogus_backup_root)
 
         connection = sqlite3.connect(live_db)
@@ -282,7 +282,7 @@ class MigratorCliTest(unittest.TestCase):
         bogus_file.parent.mkdir(parents=True, exist_ok=True)
         bogus_file.write_text('{"type":"not_session_meta"}\n', encoding="utf-8")
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ValueError, "Backup metadata is missing"):
             self.module.restore_rollout_backups(target_codex_home, bogus_rollout_root)
         self.assertIn('"type":"session_meta"', target_file.read_text(encoding="utf-8"))
 
@@ -299,7 +299,7 @@ class MigratorCliTest(unittest.TestCase):
             },
         )
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ValueError, "Backup metadata mismatch"):
             self.module.restore_rollout_backups(target_codex_home, truncated_rollout_root)
         self.assertIn('"type":"session_meta"', target_file.read_text(encoding="utf-8"))
 
@@ -327,6 +327,7 @@ class MigratorCliTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('"model_provider":"old"', self.read_rollout_text(rollout))
+        self.assertIn("Rollback backup retained at:", result.stderr)
 
     def test_rollout_requires_session_meta_first_and_single_meta(self) -> None:
         codex_home = self.make_codex_home()
