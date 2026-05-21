@@ -35,6 +35,7 @@ class RolloutReport:
     provider_counts_before: Counter[str] = field(default_factory=Counter)
     provider_counts_after: Counter[str] = field(default_factory=Counter)
     matched_session_ids: set[str] = field(default_factory=set)
+    candidate_session_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -580,6 +581,7 @@ def rewrite_rollout_file(
         session_meta["model_provider"] = target_provider
         payload["payload"] = session_meta
         report.session_meta_rewritten += 1
+        report.candidate_session_ids.add(session_id)
         final_provider = target_provider
         replacements[line_number] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         file_changed = True
@@ -899,7 +901,7 @@ def main() -> int:
             if missing_session_ids:
                 missing_label = ", ".join(sorted(missing_session_ids))
                 raise SystemExit(f"Requested --session-id values were not found in rollout history: {missing_label}")
-        sqlite_session_ids = set(rollout_report.matched_session_ids)
+        sqlite_session_ids = set(rollout_report.candidate_session_ids)
         missing_sqlite_ids = sqlite_session_ids - fetch_existing_thread_ids(state_db_path, sqlite_session_ids)
         if missing_sqlite_ids:
             missing_sqlite_label = ", ".join(sorted(missing_sqlite_ids))

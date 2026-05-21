@@ -158,6 +158,29 @@ class MigratorCliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing from SQLite threads", result.stdout + result.stderr)
 
+    def test_target_provider_orphan_does_not_block_other_candidates(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
+        self.write_rollout(codex_home, "sess-old", "old", relpath="sessions/old.jsonl")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-old", "old")])
+
+        result = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
+        self.assertIn("- session_meta rewritten: 1", result.stdout)
+        self.assertIn("- rows considered: 1", result.stdout)
+
+        apply_result = self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+        self.assertIn("Mode: apply", apply_result.stdout)
+        self.assertEqual(self.fetch_provider(db_path, "sess-old"), "OpenAI")
+
     def test_rollout_missing_session_id_fails(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
