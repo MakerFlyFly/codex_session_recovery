@@ -1,0 +1,4 @@
+backups/
+codex-provider-history-*/
+__pycache__/
+*.pyc
