@@ -329,6 +329,25 @@ class MigratorCliTest(unittest.TestCase):
         self.assertIn('"model_provider":"old"', self.read_rollout_text(rollout))
         self.assertIn("Rollback backup retained at:", result.stderr)
 
+    def test_pre_backup_failure_does_not_claim_retained_backup(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        bad_rollout = codex_home / "sessions" / "bad.jsonl"
+        bad_rollout.parent.mkdir(parents=True, exist_ok=True)
+        bad_rollout.write_text('{"type":"message","payload":{}}\n', encoding="utf-8")
+        self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "old")])
+
+        result = self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--apply",
+            "--allow-live-codex",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Rollback backup retained at:", result.stderr)
+
     def test_rollout_requires_session_meta_first_and_single_meta(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')

@@ -464,6 +464,19 @@ def rollback_migration(codex_home: Path, state_db_path: Path | None, backup_root
     return errors
 
 
+def backup_root_has_snapshots(backup_root: Path | None) -> bool:
+    if backup_root is None or not backup_root.exists():
+        return False
+    for relative_dir in ("sessions", "archived_sessions", "sqlite"):
+        root = backup_root / relative_dir
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and not path.name.endswith(".meta.json"):
+                return True
+    return False
+
+
 def detect_live_codex_processes() -> list[str]:
     try:
         if os.name == "nt":
@@ -863,7 +876,7 @@ def main() -> int:
             rollback_errors = rollback_migration(codex_home, state_db_path, backup_root)
             for rollback_error in rollback_errors:
                 print(f"Rollback warning: {rollback_error}", file=sys.stderr)
-            if backup_root is not None and backup_root.exists():
+            if backup_root_has_snapshots(backup_root):
                 print(f"Rollback backup retained at: {backup_root}", file=sys.stderr)
         raise
     finally:
