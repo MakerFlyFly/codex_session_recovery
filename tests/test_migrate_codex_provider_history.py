@@ -299,6 +299,18 @@ class MigratorCliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing a non-empty id", result.stdout + result.stderr)
 
+    def test_rollout_missing_provider_fails(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        bad_rollout = codex_home / "sessions" / "missing-provider.jsonl"
+        bad_rollout.parent.mkdir(parents=True, exist_ok=True)
+        bad_rollout.write_text('{"type":"session_meta","payload":{"id":"sess-a"}}\n', encoding="utf-8")
+        self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "old")])
+
+        result = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing a non-empty model_provider", result.stdout + result.stderr)
+
     def test_single_quote_bom_and_relative_sqlite_home(self) -> None:
         codex_home = self.make_codex_home()
         sqlite_home = codex_home / "sqlite"
@@ -426,6 +438,9 @@ class MigratorCliTest(unittest.TestCase):
             "--allow-live-codex",
             check=True,
         )
+        run_dirs = [path for path in backup_root.iterdir() if path.is_dir()]
+        self.assertEqual(len(run_dirs), 1)
+        self.assertTrue((run_dirs[0] / ".gitignore").exists())
         rerun = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
         self.assertIn("- files scanned: 1", rerun.stdout)
         self.assertIn("- session_meta rewritten: 0", rerun.stdout)

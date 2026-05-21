@@ -257,6 +257,9 @@ def mark_backup_root(path: Optional[Path]) -> None:
     if marker_path.exists():
         return
     marker_path.write_text("codex provider history backup\n", encoding="utf-8")
+    gitignore_path = path / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text("*\n!.gitignore\n", encoding="utf-8")
 
 
 def compute_file_fingerprint(path: Path) -> dict[str, Union[int, str]]:
@@ -323,6 +326,9 @@ def inspect_rollout_session_meta(path: Path) -> tuple[int, dict[str, object]]:
                 session_id = session_meta.get("id")
                 if not isinstance(session_id, str) or not session_id:
                     raise ValueError(f"session_meta is missing a non-empty id at {path}:{line_number}")
+                model_provider = session_meta.get("model_provider")
+                if not isinstance(model_provider, str) or not model_provider:
+                    raise ValueError(f"session_meta is missing a non-empty model_provider at {path}:{line_number}")
                 first_payload = payload
                 continue
 
