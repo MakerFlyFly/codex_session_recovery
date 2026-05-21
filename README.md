@@ -29,7 +29,8 @@ It also assumes each rollout file represents one thread, with exactly one
 4. If `--apply` fails, inspect the reported backup directory and rollback
    warnings before retrying.
 
-The script treats rollout JSONL and SQLite thread history as one unit. If they
+The script treats rollout JSONL and SQLite thread history as one unit for the
+sessions it actively migrates or explicitly repairs. If those selected sessions
 cannot be kept aligned, it fails instead of doing a one-sided migration.
 
 ## Examples

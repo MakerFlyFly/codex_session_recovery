@@ -677,13 +677,13 @@ def fetch_existing_thread_providers(db_path: Optional[Path], session_ids: set[st
         connection.close()
 
 
-def populate_temp_session_table(connection: sqlite3.Connection, session_ids: set[str]) -> None:
-    connection.execute("DROP TABLE IF EXISTS selected_session_ids")
-    connection.execute("CREATE TEMP TABLE selected_session_ids (id TEXT PRIMARY KEY)")
+def populate_temp_session_table(connection: sqlite3.Connection, session_ids: set[str], table_name: str = "selected_session_ids") -> None:
+    connection.execute(f"DROP TABLE IF EXISTS temp.{table_name}")
+    connection.execute(f"CREATE TEMP TABLE {table_name} (id TEXT PRIMARY KEY)")
     if not session_ids:
         return
     rows = [(session_id,) for session_id in sorted(session_ids)]
-    connection.executemany("INSERT INTO selected_session_ids (id) VALUES (?)", rows)
+    connection.executemany(f"INSERT INTO {table_name} (id) VALUES (?)", rows)
 
 
 def build_where_clause(
@@ -691,30 +691,43 @@ def build_where_clause(
     source_providers: Optional[set[str]],
     keep_providers: set[str],
     session_ids: Optional[set[str]],
+    force_session_ids: Optional[set[str]] = None,
     use_temp_session_table: bool = False,
 ) -> tuple[str, list[str]]:
-    clauses = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
-    params: list[str] = [target_provider]
+    base_conditions = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
+    clause_parts: list[str] = []
+    params: list[str] = []
 
+    candidate_conditions = list(base_conditions)
+    candidate_params = [target_provider]
     if source_providers:
         placeholders = ", ".join("?" for _ in sorted(source_providers))
-        clauses.append(f"model_provider IN ({placeholders})")
-        params.extend(sorted(source_providers))
+        candidate_conditions.append(f"model_provider IN ({placeholders})")
+        candidate_params.extend(sorted(source_providers))
     if keep_providers:
         placeholders = ", ".join("?" for _ in sorted(keep_providers))
-        clauses.append(f"model_provider NOT IN ({placeholders})")
-        params.extend(sorted(keep_providers))
+        candidate_conditions.append(f"model_provider NOT IN ({placeholders})")
+        candidate_params.extend(sorted(keep_providers))
 
     if session_ids is not None and not session_ids:
-        clauses.append("1 = 0")
+        candidate_conditions.append("1 = 0")
     elif session_ids and use_temp_session_table:
-        clauses.append("id IN (SELECT id FROM selected_session_ids)")
+        candidate_conditions.append("id IN (SELECT id FROM selected_session_ids)")
     elif session_ids:
         placeholders = ", ".join("?" for _ in sorted(session_ids))
-        clauses.append(f"id IN ({placeholders})")
-        params.extend(sorted(session_ids))
+        candidate_conditions.append(f"id IN ({placeholders})")
+        candidate_params.extend(sorted(session_ids))
 
-    return " AND ".join(clauses), params
+    clause_parts.append("(" + " AND ".join(candidate_conditions) + ")")
+    params.extend(candidate_params)
+
+    if force_session_ids:
+        force_conditions = list(base_conditions)
+        force_conditions.append("id IN (SELECT id FROM forced_session_ids)")
+        clause_parts.append("(" + " AND ".join(force_conditions) + ")")
+        params.append(target_provider)
+
+    return " OR ".join(clause_parts), params
 
 
 def simulate_sqlite_counts(
@@ -755,6 +768,7 @@ def migrate_sqlite(
     source_providers: Optional[set[str]],
     keep_providers: set[str],
     session_ids: Optional[set[str]],
+    force_session_ids: Optional[set[str]],
     apply: bool,
     backup_root: Optional[Path],
 ) -> SqliteReport:
@@ -771,11 +785,15 @@ def migrate_sqlite(
         if use_temp_session_table:
             populate_temp_session_table(connection, session_ids)
             connection.commit()
+        if force_session_ids:
+            populate_temp_session_table(connection, force_session_ids, table_name="forced_session_ids")
+            connection.commit()
         where_clause, params = build_where_clause(
             target_provider,
             source_providers,
             keep_providers,
             session_ids,
+            force_session_ids=force_session_ids,
             use_temp_session_table=use_temp_session_table,
         )
         matching_provider_counts_before = fetch_sqlite_provider_counts(connection, where_clause, params)
@@ -937,6 +955,7 @@ def main() -> int:
             source_providers=source_providers,
             keep_providers=keep_providers,
             session_ids=sqlite_session_ids,
+            force_session_ids=stale_target_sqlite_ids,
             apply=args.apply,
             backup_root=backup_root,
         )

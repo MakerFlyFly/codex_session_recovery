@@ -185,16 +185,16 @@ class MigratorCliTest(unittest.TestCase):
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
         self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
-        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "old")])
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "legacy-b")])
 
-        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
+        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-a", check=True)
         self.assertIn("- rows considered: 1", dry_run.stdout)
 
         self.run_cli(
             "--codex-home",
             str(codex_home),
             "--source-provider",
-            "old",
+            "legacy-a",
             "--apply",
             "--allow-live-codex",
             check=True,
@@ -271,6 +271,7 @@ class MigratorCliTest(unittest.TestCase):
             source_providers={"old"},
             keep_providers={"OpenAI"},
             session_ids=session_ids,
+            force_session_ids=None,
             apply=False,
             backup_root=None,
         )
