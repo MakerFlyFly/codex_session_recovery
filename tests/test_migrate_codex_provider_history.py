@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 
@@ -49,7 +50,7 @@ class MigratorCliTest(unittest.TestCase):
     def write_rollout(
         self,
         codex_home: Path,
-        session_id: str | None,
+        session_id: Optional[str],
         provider: str = "old",
         bom: bool = False,
         relpath: str = "sessions/sample.jsonl",
@@ -65,7 +66,7 @@ class MigratorCliTest(unittest.TestCase):
         path.write_text(text, encoding=encoding)
         return path
 
-    def make_threads_db(self, path: Path, rows: list[tuple[str, str]] | None = None) -> Path:
+    def make_threads_db(self, path: Path, rows: Optional[list[tuple[str, str]]] = None) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path)
         try:
@@ -83,7 +84,7 @@ class MigratorCliTest(unittest.TestCase):
     def read_rollout_bytes(self, path: Path) -> bytes:
         return path.read_bytes()
 
-    def fetch_provider(self, db_path: Path, session_id: str) -> str | None:
+    def fetch_provider(self, db_path: Path, session_id: str) -> Optional[str]:
         connection = sqlite3.connect(db_path)
         try:
             row = connection.execute("SELECT model_provider FROM threads WHERE id = ?", (session_id,)).fetchone()
@@ -91,7 +92,7 @@ class MigratorCliTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def run_cli(self, *args: str, env: dict[str, str] | None = None, check: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_cli(self, *args: str, env: Optional[dict[str, str]] = None, check: bool = False) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         merged_env.pop("CODEX_SQLITE_HOME", None)
         if env:
@@ -275,6 +276,28 @@ class MigratorCliTest(unittest.TestCase):
         )
         self.assertNotEqual(second.returncode, 0)
         self.assertIn('"model_provider":"p2"', self.read_rollout_text(rollout))
+
+    def test_backup_dir_inside_sessions_is_excluded_from_future_scans(self) -> None:
+        codex_home = self.make_codex_home()
+        backup_root = codex_home / "sessions" / "backups"
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-a", "old")
+        self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "old")])
+
+        self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--backup-dir",
+            str(backup_root),
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+        rerun = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
+        self.assertIn("- files scanned: 1", rerun.stdout)
+        self.assertIn("- session_meta rewritten: 0", rerun.stdout)
 
     def test_invalid_backup_artifacts_are_rejected(self) -> None:
         live_db = self.temp_root / "live.sqlite"
