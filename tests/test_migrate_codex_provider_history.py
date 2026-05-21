@@ -66,11 +66,17 @@ class MigratorCliTest(unittest.TestCase):
         path.write_text(text, encoding=encoding)
         return path
 
-    def make_threads_db(self, path: Path, rows: Optional[list[tuple[str, str]]] = None) -> Path:
+    def make_threads_db(
+        self,
+        path: Path,
+        rows: Optional[list[tuple[str, Optional[str]]]] = None,
+        allow_null_provider: bool = False,
+    ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path)
         try:
-            connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+            provider_constraint = "" if allow_null_provider else " NOT NULL"
+            connection.execute(f"CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT{provider_constraint})")
             for row in rows or []:
                 connection.execute("INSERT INTO threads (id, model_provider) VALUES (?, ?)", row)
             connection.commit()
@@ -196,6 +202,46 @@ class MigratorCliTest(unittest.TestCase):
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
         self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
         db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "legacy-b")])
+
+        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-b", check=True)
+        self.assertIn("- rows considered: 1", dry_run.stdout)
+
+        self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "legacy-b",
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+        self.assertEqual(self.fetch_provider(db_path, "sess-target"), "OpenAI")
+
+    def test_null_sqlite_provider_row_is_repaired_for_candidate_rollout(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-null", "old", relpath="sessions/null.jsonl")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-null", None)], allow_null_provider=True)
+
+        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
+        self.assertIn("- rows considered: 1", dry_run.stdout)
+
+        self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+        self.assertEqual(self.fetch_provider(db_path, "sess-null"), "OpenAI")
+
+    def test_null_sqlite_provider_row_is_repaired_for_target_rollout(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target-null.jsonl")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", None)], allow_null_provider=True)
 
         dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-b", check=True)
         self.assertIn("- rows considered: 1", dry_run.stdout)

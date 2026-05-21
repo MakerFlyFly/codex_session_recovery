@@ -64,6 +64,8 @@ python tools/migrate_codex_provider_history.py `
 - Dry-run is the default. Nothing is written unless `--apply` is provided.
 - `--target-provider` defaults to `config.toml`'s active `model_provider`.
 - `--backup-dir` stores run-specific backups under a `run-<id>` subdirectory.
+- If you point `--backup-dir` into a repository, prefer a path that is already
+  ignored by Git or keep it outside the repository entirely.
 - If `--backup-dir` is omitted, failed apply runs keep their rollback backup in a
   system temporary directory and print that path to stderr.
 - `--allow-live-codex` exists as an escape hatch, but the intended workflow is

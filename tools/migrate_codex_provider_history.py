@@ -546,6 +546,19 @@ def should_migrate(
     return provider_value in source_providers
 
 
+def needs_sqlite_repair(
+    provider_value: object,
+    target_provider: str,
+    keep_providers: set[str],
+    source_providers: Optional[set[str]],
+) -> bool:
+    if provider_value is None:
+        return True
+    if isinstance(provider_value, str) and not provider_value:
+        return True
+    return should_migrate(provider_value, target_provider, keep_providers, source_providers)
+
+
 def rewrite_rollout_file(
     path: Path,
     codex_home: Path,
@@ -663,7 +676,7 @@ def fetch_existing_thread_ids(db_path: Optional[Path], session_ids: set[str]) ->
         connection.close()
 
 
-def fetch_existing_thread_providers(db_path: Optional[Path], session_ids: set[str]) -> dict[str, str]:
+def fetch_existing_thread_providers(db_path: Optional[Path], session_ids: set[str]) -> dict[str, Optional[str]]:
     if db_path is None or not db_path.exists() or not session_ids:
         return {}
     connection = sqlite3.connect(str(db_path))
@@ -672,7 +685,11 @@ def fetch_existing_thread_providers(db_path: Optional[Path], session_ids: set[st
         rows = connection.execute(
             "SELECT id, model_provider FROM threads WHERE id IN (SELECT id FROM selected_session_ids)"
         ).fetchall()
-        return {str(row[0]): str(row[1]) for row in rows if row and row[0] is not None and row[1] is not None}
+        return {
+            str(row[0]): (None if row[1] is None else str(row[1]))
+            for row in rows
+            if row and row[0] is not None
+        }
     finally:
         connection.close()
 
@@ -693,15 +710,15 @@ def build_where_clause(
     session_ids: Optional[set[str]],
     use_temp_session_table: bool = False,
 ) -> tuple[str, list[str]]:
-    candidate_conditions = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
+    candidate_conditions = ["(model_provider IS NULL OR model_provider = '' OR model_provider != ?)"]
     params: list[str] = [target_provider]
     if source_providers:
         placeholders = ", ".join("?" for _ in sorted(source_providers))
-        candidate_conditions.append(f"model_provider IN ({placeholders})")
+        candidate_conditions.append(f"(model_provider IS NULL OR model_provider = '' OR model_provider IN ({placeholders}))")
         params.extend(sorted(source_providers))
     if keep_providers:
         placeholders = ", ".join("?" for _ in sorted(keep_providers))
-        candidate_conditions.append(f"model_provider NOT IN ({placeholders})")
+        candidate_conditions.append(f"(model_provider IS NULL OR model_provider = '' OR model_provider NOT IN ({placeholders}))")
         params.extend(sorted(keep_providers))
 
     if session_ids is not None and not session_ids:
@@ -929,7 +946,7 @@ def main() -> int:
             if rollout_provider == target_provider
             and session_id in existing_sqlite_providers
             and existing_sqlite_providers[session_id] != target_provider
-            and should_migrate(existing_sqlite_providers[session_id], target_provider, keep_providers, source_providers)
+            and needs_sqlite_repair(existing_sqlite_providers[session_id], target_provider, keep_providers, source_providers)
         }
         sqlite_session_ids.update(stale_target_sqlite_ids)
         missing_sqlite_ids = rollout_report.candidate_session_ids - set(existing_sqlite_providers)
