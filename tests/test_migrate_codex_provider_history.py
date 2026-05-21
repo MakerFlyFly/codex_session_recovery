@@ -212,6 +212,26 @@ class MigratorCliTest(unittest.TestCase):
         result = self.run_cli("--codex-home", str(codex_home), env={"CODEX_SQLITE_HOME": "sqlite"}, check=True)
         self.assertIn(f"State DB: {db_path}", result.stdout)
 
+    def test_large_session_id_sets_do_not_hit_sqlite_variable_limits(self) -> None:
+        db_path = self.temp_root / "large.sqlite"
+        rows = [(f"sess-{index:04d}", "old") for index in range(1200)]
+        self.make_threads_db(db_path, rows)
+        session_ids = {session_id for session_id, _ in rows}
+
+        existing_ids = self.module.fetch_existing_thread_ids(db_path, session_ids)
+        self.assertEqual(existing_ids, session_ids)
+
+        report = self.module.migrate_sqlite(
+            db_path=db_path,
+            target_provider="OpenAI",
+            source_providers={"old"},
+            keep_providers={"OpenAI"},
+            session_ids=session_ids,
+            apply=False,
+            backup_root=None,
+        )
+        self.assertEqual(report.rows_considered, 1200)
+
     def test_backup_dir_reuse_does_not_restore_stale_state(self) -> None:
         codex_home = self.make_codex_home()
         backup_root = self.temp_root / "backup-root"

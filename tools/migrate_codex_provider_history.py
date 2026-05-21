@@ -617,8 +617,8 @@ def migrate_rollouts(
 
 def fetch_sqlite_provider_counts(
     conn: sqlite3.Connection,
-    where_clause: str | None = None,
-    params: list[str] | tuple[str, ...] | None = None,
+    where_clause: "Optional[str]" = None,
+    params: "Optional[Union[list[str], tuple[str, ...]]]" = None,
 ) -> list[tuple[str | None, int]]:
     sql = "SELECT model_provider, COUNT(*) FROM threads"
     if where_clause:
@@ -633,11 +633,20 @@ def fetch_existing_thread_ids(db_path: Path | None, session_ids: set[str]) -> se
         return set()
     connection = sqlite3.connect(str(db_path))
     try:
-        placeholders = ", ".join("?" for _ in sorted(session_ids))
-        rows = connection.execute(f"SELECT id FROM threads WHERE id IN ({placeholders})", sorted(session_ids)).fetchall()
+        populate_temp_session_table(connection, session_ids)
+        rows = connection.execute("SELECT id FROM threads WHERE id IN (SELECT id FROM selected_session_ids)").fetchall()
         return {str(row[0]) for row in rows if row and row[0]}
     finally:
         connection.close()
+
+
+def populate_temp_session_table(connection: sqlite3.Connection, session_ids: set[str]) -> None:
+    connection.execute("DROP TABLE IF EXISTS selected_session_ids")
+    connection.execute("CREATE TEMP TABLE selected_session_ids (id TEXT PRIMARY KEY)")
+    if not session_ids:
+        return
+    rows = [(session_id,) for session_id in sorted(session_ids)]
+    connection.executemany("INSERT INTO selected_session_ids (id) VALUES (?)", rows)
 
 
 def build_where_clause(
@@ -645,6 +654,7 @@ def build_where_clause(
     source_providers: set[str] | None,
     keep_providers: set[str],
     session_ids: set[str] | None,
+    use_temp_session_table: bool = False,
 ) -> tuple[str, list[str]]:
     clauses = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
     params: list[str] = [target_provider]
@@ -660,6 +670,8 @@ def build_where_clause(
 
     if session_ids is not None and not session_ids:
         clauses.append("1 = 0")
+    elif session_ids and use_temp_session_table:
+        clauses.append("id IN (SELECT id FROM selected_session_ids)")
     elif session_ids:
         placeholders = ", ".join("?" for _ in sorted(session_ids))
         clauses.append(f"id IN ({placeholders})")
@@ -718,7 +730,17 @@ def migrate_sqlite(
     connection = sqlite3.connect(db_path)
     try:
         report.provider_counts_before = fetch_sqlite_provider_counts(connection)
-        where_clause, params = build_where_clause(target_provider, source_providers, keep_providers, session_ids)
+        use_temp_session_table = session_ids is not None and bool(session_ids)
+        if use_temp_session_table:
+            populate_temp_session_table(connection, session_ids)
+            connection.commit()
+        where_clause, params = build_where_clause(
+            target_provider,
+            source_providers,
+            keep_providers,
+            session_ids,
+            use_temp_session_table=use_temp_session_table,
+        )
         matching_provider_counts_before = fetch_sqlite_provider_counts(connection, where_clause, params)
         report.rows_considered = int(connection.execute(f"SELECT COUNT(*) FROM threads WHERE {where_clause}", params).fetchone()[0])
         report.rows_needing_update = report.rows_considered
