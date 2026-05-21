@@ -181,6 +181,26 @@ class MigratorCliTest(unittest.TestCase):
         self.assertIn("Mode: apply", apply_result.stdout)
         self.assertEqual(self.fetch_provider(db_path, "sess-old"), "OpenAI")
 
+    def test_target_provider_rollout_fixes_stale_sqlite_provider(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "old")])
+
+        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
+        self.assertIn("- rows considered: 1", dry_run.stdout)
+
+        self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+        self.assertEqual(self.fetch_provider(db_path, "sess-target"), "OpenAI")
+
     def test_rollout_missing_session_id_fails(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')

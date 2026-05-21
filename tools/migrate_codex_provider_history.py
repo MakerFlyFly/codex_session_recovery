@@ -36,6 +36,7 @@ class RolloutReport:
     provider_counts_after: Counter[str] = field(default_factory=Counter)
     matched_session_ids: set[str] = field(default_factory=set)
     candidate_session_ids: set[str] = field(default_factory=set)
+    matched_session_providers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -574,6 +575,7 @@ def rewrite_rollout_file(
     report.matched_session_ids.add(session_id)
     provider_value = session_meta.get("model_provider")
     provider_key = provider_value if isinstance(provider_value, str) and provider_value else "<missing>"
+    report.matched_session_providers[session_id] = provider_key
     report.provider_counts_before[provider_key] += 1
     final_provider = provider_key
 
@@ -657,6 +659,20 @@ def fetch_existing_thread_ids(db_path: Optional[Path], session_ids: set[str]) ->
         populate_temp_session_table(connection, session_ids)
         rows = connection.execute("SELECT id FROM threads WHERE id IN (SELECT id FROM selected_session_ids)").fetchall()
         return {str(row[0]) for row in rows if row and row[0]}
+    finally:
+        connection.close()
+
+
+def fetch_existing_thread_providers(db_path: Optional[Path], session_ids: set[str]) -> dict[str, str]:
+    if db_path is None or not db_path.exists() or not session_ids:
+        return {}
+    connection = sqlite3.connect(str(db_path))
+    try:
+        populate_temp_session_table(connection, session_ids)
+        rows = connection.execute(
+            "SELECT id, model_provider FROM threads WHERE id IN (SELECT id FROM selected_session_ids)"
+        ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows if row and row[0] is not None and row[1] is not None}
     finally:
         connection.close()
 
@@ -901,8 +917,17 @@ def main() -> int:
             if missing_session_ids:
                 missing_label = ", ".join(sorted(missing_session_ids))
                 raise SystemExit(f"Requested --session-id values were not found in rollout history: {missing_label}")
+        existing_sqlite_providers = fetch_existing_thread_providers(state_db_path, rollout_report.matched_session_ids)
         sqlite_session_ids = set(rollout_report.candidate_session_ids)
-        missing_sqlite_ids = sqlite_session_ids - fetch_existing_thread_ids(state_db_path, sqlite_session_ids)
+        stale_target_sqlite_ids = {
+            session_id
+            for session_id, rollout_provider in rollout_report.matched_session_providers.items()
+            if rollout_provider == target_provider
+            and session_id in existing_sqlite_providers
+            and existing_sqlite_providers[session_id] != target_provider
+        }
+        sqlite_session_ids.update(stale_target_sqlite_ids)
+        missing_sqlite_ids = rollout_report.candidate_session_ids - set(existing_sqlite_providers)
         if missing_sqlite_ids:
             missing_sqlite_label = ", ".join(sorted(missing_sqlite_ids))
             raise SystemExit(f"Matched rollout sessions are missing from SQLite threads: {missing_sqlite_label}")
