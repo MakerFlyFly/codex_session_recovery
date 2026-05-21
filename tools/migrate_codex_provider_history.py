@@ -742,7 +742,7 @@ def simulate_sqlite_counts(
     counter: Counter[Optional[str]] = Counter()
     for provider_key, count in provider_counts_before:
         final_provider = provider_key
-        if should_migrate(provider_key, target_provider, keep_providers, source_providers):
+        if needs_sqlite_repair(provider_key, target_provider, keep_providers, source_providers):
             final_provider = target_provider
         counter[final_provider] += count
     return sorted(counter.items(), key=lambda item: (-item[1], "" if item[0] is None else item[0]))
@@ -953,6 +953,24 @@ def main() -> int:
         if missing_sqlite_ids:
             missing_sqlite_label = ", ".join(sorted(missing_sqlite_ids))
             raise SystemExit(f"Matched rollout sessions are missing from SQLite threads: {missing_sqlite_label}")
+        conflicting_candidate_sqlite_ids = {
+            session_id
+            for session_id in rollout_report.candidate_session_ids
+            if session_id in existing_sqlite_providers
+            and existing_sqlite_providers[session_id] != target_provider
+            and not needs_sqlite_repair(
+                existing_sqlite_providers[session_id],
+                target_provider,
+                keep_providers,
+                source_providers,
+            )
+        }
+        if conflicting_candidate_sqlite_ids:
+            conflicting_label = ", ".join(sorted(conflicting_candidate_sqlite_ids))
+            raise SystemExit(
+                "Matched rollout sessions conflict with current SQLite provider filters: "
+                f"{conflicting_label}"
+            )
         sqlite_report = migrate_sqlite(
             db_path=state_db_path,
             target_provider=target_provider,

@@ -174,6 +174,18 @@ class MigratorCliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing from SQLite threads", result.stdout + result.stderr)
 
+    def test_candidate_rollout_conflicting_sqlite_provider_fails_before_apply(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        rollout = self.write_rollout(codex_home, "sess-a", "old")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "legacy-b")])
+
+        result = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflict with current SQLite provider filters", result.stdout + result.stderr)
+        self.assertIn('"model_provider":"old"', self.read_rollout_text(rollout))
+        self.assertEqual(self.fetch_provider(db_path, "sess-a"), "legacy-b")
+
     def test_target_provider_orphan_does_not_block_other_candidates(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
@@ -225,6 +237,7 @@ class MigratorCliTest(unittest.TestCase):
 
         dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old", check=True)
         self.assertIn("- rows considered: 1", dry_run.stdout)
+        self.assertIn("- OpenAI: 1", dry_run.stdout)
 
         self.run_cli(
             "--codex-home",
@@ -245,6 +258,7 @@ class MigratorCliTest(unittest.TestCase):
 
         dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-b", check=True)
         self.assertIn("- rows considered: 1", dry_run.stdout)
+        self.assertIn("- OpenAI: 1", dry_run.stdout)
 
         self.run_cli(
             "--codex-home",
