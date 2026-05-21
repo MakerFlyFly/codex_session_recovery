@@ -13,6 +13,9 @@ It targets the current Codex Desktop storage layout:
 It is not a general history repair tool for unrelated Codex formats or future
 storage layouts that diverge from the structure above.
 
+It also assumes each rollout file represents one thread, with exactly one
+`session_meta` record as the first non-empty line.
+
 ## Requirements
 
 - Python 3.9+

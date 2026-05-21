@@ -80,6 +80,9 @@ class MigratorCliTest(unittest.TestCase):
     def read_rollout_text(self, path: Path) -> str:
         return path.read_text(encoding="utf-8-sig")
 
+    def read_rollout_bytes(self, path: Path) -> bytes:
+        return path.read_bytes()
+
     def fetch_provider(self, db_path: Path, session_id: str) -> str | None:
         connection = sqlite3.connect(db_path)
         try:
@@ -177,6 +180,28 @@ class MigratorCliTest(unittest.TestCase):
         self.assertIn(f"State DB: {db_path}", result.stdout)
         self.assertIn("- session_meta matched: 1", result.stdout)
 
+    def test_apply_preserves_rollout_bom_and_newline_style(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        rollout = self.write_rollout(codex_home, "sess-a", "old", bom=True)
+        rollout.write_bytes(self.read_rollout_bytes(rollout).replace(b"\r\n", b"\n"))
+        self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "old")])
+
+        self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "old",
+            "--apply",
+            "--allow-live-codex",
+            check=True,
+        )
+
+        raw = self.read_rollout_bytes(rollout)
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"\n", raw)
+        self.assertNotIn(b"\r\n", raw)
+
     def test_relative_codex_sqlite_home_env_resolves_from_codex_home(self) -> None:
         codex_home = self.make_codex_home()
         sqlite_home = codex_home / "sqlite"
@@ -261,6 +286,23 @@ class MigratorCliTest(unittest.TestCase):
             self.module.restore_rollout_backups(target_codex_home, bogus_rollout_root)
         self.assertIn('"type":"session_meta"', target_file.read_text(encoding="utf-8"))
 
+        truncated_rollout_root = self.temp_root / "truncated-rollout"
+        truncated_file = truncated_rollout_root / "sessions" / "thread.jsonl"
+        truncated_file.parent.mkdir(parents=True, exist_ok=True)
+        truncated_file.write_text('{"type":"session_meta","payload":{"id":"sess-a","model_provider":"OpenAI"}}\n', encoding="utf-8")
+        self.module.write_metadata_atomic(
+            self.module.metadata_path_for_backup(truncated_file),
+            {
+                "kind": "rollout",
+                "sha256": "0" * 64,
+                "size": 999,
+            },
+        )
+
+        with self.assertRaises(Exception):
+            self.module.restore_rollout_backups(target_codex_home, truncated_rollout_root)
+        self.assertIn('"type":"session_meta"', target_file.read_text(encoding="utf-8"))
+
     def test_schema_error_rolls_back_rollout(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
@@ -285,6 +327,34 @@ class MigratorCliTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('"model_provider":"old"', self.read_rollout_text(rollout))
+
+    def test_rollout_requires_session_meta_first_and_single_meta(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.make_threads_db(codex_home / "state_1.sqlite", [("sess-a", "old")])
+
+        bad_first = codex_home / "sessions" / "bad-first.jsonl"
+        bad_first.parent.mkdir(parents=True, exist_ok=True)
+        bad_first.write_text(
+            '{"type":"message","payload":{}}\n'
+            '{"type":"session_meta","payload":{"id":"sess-a","model_provider":"old"}}\n',
+            encoding="utf-8",
+        )
+        result = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("First non-empty line must be session_meta", result.stdout + result.stderr)
+
+        bad_first.unlink()
+        duplicate = codex_home / "sessions" / "duplicate.jsonl"
+        duplicate.write_text(
+            '{"type":"session_meta","payload":{"id":"sess-a","model_provider":"old"}}\n'
+            '{"type":"message","payload":{}}\n'
+            '{"type":"session_meta","payload":{"id":"sess-b","model_provider":"old"}}\n',
+            encoding="utf-8",
+        )
+        result = self.run_cli("--codex-home", str(codex_home), "--source-provider", "old")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Multiple session_meta records are not supported", result.stdout + result.stderr)
 
     def test_keyboard_interrupt_rolls_back(self) -> None:
         codex_home = self.make_codex_home()
@@ -382,4 +452,3 @@ class MigratorCliTest(unittest.TestCase):
 
         with mock.patch.object(self.module.subprocess, "run", side_effect=OSError("boom")):
             self.assertEqual(self.module.detect_live_codex_processes(), [])
-

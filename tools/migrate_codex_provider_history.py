@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,7 @@ class SqliteReport:
 
 SESSION_META_PATTERN = re.compile(r'"type"\s*:\s*"session_meta"')
 TOP_LEVEL_STRING_PATTERN = re.compile(r"""^([A-Za-z0-9_]+)\s*=\s*(['"])(.*?)\2\s*(?:#.*)?$""")
+UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,17 +239,96 @@ def prepare_backup_root(path: Path | None, apply: bool) -> tuple[Path | None, bo
     return ensure_backup_root(temporary), True
 
 
-def validate_rollout_jsonl(path: Path) -> None:
+def compute_file_fingerprint(path: Path) -> dict[str, int | str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return {"sha256": digest.hexdigest(), "size": size}
+
+
+def write_metadata_atomic(path: Path, data: dict[str, int | str]) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp-{next(tempfile._get_candidate_names())}")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def metadata_path_for_backup(path: Path) -> Path:
+    return path.with_name(f"{path.name}.meta.json")
+
+
+def validate_backup_snapshot(path: Path, *, expected_kind: str) -> None:
+    metadata_path = metadata_path_for_backup(path)
+    if not metadata_path.exists():
+        raise ValueError(f"Backup metadata is missing: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("kind") != expected_kind:
+        raise ValueError(f"Backup metadata kind mismatch for {path}")
+    actual = compute_file_fingerprint(path)
+    if metadata.get("sha256") != actual["sha256"] or metadata.get("size") != actual["size"]:
+        raise ValueError(f"Backup metadata mismatch for {path}")
+
+
+def inspect_rollout_session_meta(path: Path) -> tuple[int, dict[str, object]]:
+    first_non_empty_line_number: int | None = None
+    first_payload: dict[str, object] | None = None
     with path.open("r", encoding="utf-8-sig") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.rstrip("\n")
+            if not line.strip():
                 continue
-            payload = json.loads(line)
-            if payload.get("type") != "session_meta":
-                raise ValueError(f"Backup file does not start with session_meta: {path}")
-            return
-    raise ValueError(f"Backup file is empty: {path}")
+
+            if first_non_empty_line_number is None:
+                first_non_empty_line_number = line_number
+                if not SESSION_META_PATTERN.search(line):
+                    raise ValueError(f"First non-empty line must be session_meta: {path}:{line_number}")
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL line at {path}:{line_number}: {exc}") from exc
+                if payload.get("type") != "session_meta":
+                    raise ValueError(f"First non-empty line must be session_meta: {path}:{line_number}")
+                session_meta = payload.get("payload")
+                if not isinstance(session_meta, dict):
+                    raise ValueError(f"session_meta payload is not an object at {path}:{line_number}")
+                session_id = session_meta.get("id")
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError(f"session_meta is missing a non-empty id at {path}:{line_number}")
+                first_payload = payload
+                continue
+
+            if SESSION_META_PATTERN.search(line):
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "session_meta":
+                    raise ValueError(f"Multiple session_meta records are not supported: {path}:{line_number}")
+
+    if first_non_empty_line_number is None or first_payload is None:
+        raise ValueError(f"Backup file is empty: {path}")
+    return first_non_empty_line_number, first_payload
+
+
+def read_text_with_style(path: Path) -> tuple[str, str, bool]:
+    raw = path.read_bytes()
+    text = raw.decode("utf-8-sig")
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    has_bom = raw.startswith(UTF8_BOM)
+    return text, newline, has_bom
+
+
+def validate_rollout_jsonl(path: Path) -> None:
+    inspect_rollout_session_meta(path)
 
 
 def validate_sqlite_snapshot(path: Path) -> None:
@@ -265,21 +346,31 @@ def backup_rollout_file(src: Path, codex_home: Path, backup_root: Path | None) -
         return
     destination = backup_root / src.relative_to(codex_home)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    metadata_destination = metadata_path_for_backup(destination)
     if not destination.exists():
+        source_fingerprint = compute_file_fingerprint(src)
         temp_path = destination.with_name(f"{destination.name}.backup-{next(tempfile._get_candidate_names())}")
         try:
             shutil.copy2(src, temp_path)
             validate_rollout_jsonl(temp_path)
+            temp_fingerprint = compute_file_fingerprint(temp_path)
+            if temp_fingerprint != source_fingerprint:
+                raise ValueError(f"Rollout backup does not match source bytes: {src}")
+            write_metadata_atomic(
+                metadata_destination,
+                {"kind": "rollout", **source_fingerprint},
+            )
             os.replace(temp_path, destination)
         finally:
             if temp_path.exists():
                 temp_path.unlink()
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str, *, bom: bool = False) -> None:
     temp_path = path.with_name(f"{path.name}.tmp-{next(tempfile._get_candidate_names())}")
     try:
-        temp_path.write_text(text, encoding="utf-8")
+        encoding = "utf-8-sig" if bom else "utf-8"
+        temp_path.write_bytes(text.encode(encoding))
         os.replace(temp_path, path)
     finally:
         if temp_path.exists():
@@ -292,6 +383,7 @@ def backup_sqlite_bundle(db_path: Path, backup_root: Path | None) -> None:
     sqlite_root = backup_root / "sqlite"
     sqlite_root.mkdir(parents=True, exist_ok=True)
     destination = sqlite_root / db_path.name
+    metadata_destination = metadata_path_for_backup(destination)
     if destination.exists():
         return
 
@@ -304,6 +396,10 @@ def backup_sqlite_bundle(db_path: Path, backup_root: Path | None) -> None:
         finally:
             target.close()
         validate_sqlite_snapshot(temp_path)
+        write_metadata_atomic(
+            metadata_destination,
+            {"kind": "sqlite", **compute_file_fingerprint(temp_path)},
+        )
         os.replace(temp_path, destination)
     finally:
         source.close()
@@ -323,6 +419,7 @@ def restore_rollout_backups(codex_home: Path, backup_root: Path | None) -> None:
             destination.parent.mkdir(parents=True, exist_ok=True)
             temp_path = destination.with_name(f"{destination.name}.restore-{next(tempfile._get_candidate_names())}")
             try:
+                validate_backup_snapshot(src, expected_kind="rollout")
                 validate_rollout_jsonl(src)
                 shutil.copy2(src, temp_path)
                 os.replace(temp_path, destination)
@@ -340,6 +437,7 @@ def restore_sqlite_backup(db_path: Path | None, backup_root: Path | None) -> Non
 
     temp_path = db_path.with_name(f"{db_path.name}.restore-{next(tempfile._get_candidate_names())}")
     try:
+        validate_backup_snapshot(source, expected_kind="sqlite")
         validate_sqlite_snapshot(source)
         shutil.copy2(source, temp_path)
         os.replace(temp_path, db_path)
@@ -428,51 +526,34 @@ def rewrite_rollout_file(
 ) -> None:
     replacements: dict[int, str] = {}
     file_changed = False
+    line_number, payload = inspect_rollout_session_meta(path)
+    report.session_meta_seen += 1
+    session_meta = payload.get("payload")
+    if not isinstance(session_meta, dict):
+        raise ValueError(f"session_meta payload is not an object at {path}:{line_number}")
+    session_id = session_meta.get("id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError(f"session_meta is missing a non-empty id at {path}:{line_number}")
+    if session_ids is not None and session_id not in session_ids:
+        report.files_scanned += 1
+        return
 
-    with path.open("r", encoding="utf-8-sig") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.rstrip("\n")
-            if not line.strip():
-                continue
+    report.session_meta_matched += 1
+    report.matched_session_ids.add(session_id)
+    provider_value = session_meta.get("model_provider")
+    provider_key = provider_value if isinstance(provider_value, str) and provider_value else "<missing>"
+    report.provider_counts_before[provider_key] += 1
+    final_provider = provider_key
 
-            if not SESSION_META_PATTERN.search(line):
-                continue
+    if should_migrate(provider_value, target_provider, keep_providers, source_providers):
+        session_meta["model_provider"] = target_provider
+        payload["payload"] = session_meta
+        report.session_meta_rewritten += 1
+        final_provider = target_provider
+        replacements[line_number] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        file_changed = True
 
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSONL line at {path}:{line_number}: {exc}") from exc
-
-            if payload.get("type") != "session_meta":
-                continue
-
-            report.session_meta_seen += 1
-            session_meta = payload.get("payload")
-            if not isinstance(session_meta, dict):
-                raise ValueError(f"session_meta payload is not an object at {path}:{line_number}")
-            session_id = session_meta.get("id")
-            if not isinstance(session_id, str) or not session_id:
-                raise ValueError(f"session_meta is missing a non-empty id at {path}:{line_number}")
-            if session_ids is not None and session_id not in session_ids:
-                break
-
-            report.session_meta_matched += 1
-            report.matched_session_ids.add(session_id)
-            provider_value = session_meta.get("model_provider")
-            provider_key = provider_value if isinstance(provider_value, str) and provider_value else "<missing>"
-            report.provider_counts_before[provider_key] += 1
-            final_provider = provider_key
-
-            if should_migrate(provider_value, target_provider, keep_providers, source_providers):
-                session_meta["model_provider"] = target_provider
-                payload["payload"] = session_meta
-                report.session_meta_rewritten += 1
-                final_provider = target_provider
-                replacements[line_number] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                file_changed = True
-
-            report.provider_counts_after[final_provider] += 1
-            break
+    report.provider_counts_after[final_provider] += 1
 
     report.files_scanned += 1
     if not file_changed:
@@ -482,17 +563,17 @@ def rewrite_rollout_file(
     if not apply:
         return
 
-    original_text = path.read_text(encoding="utf-8-sig")
+    original_text, newline, has_bom = read_text_with_style(path)
     newline_at_end = original_text.endswith("\n")
     rewritten_lines = []
     for line_number, line in enumerate(original_text.splitlines(), start=1):
         rewritten_lines.append(replacements.get(line_number, line))
 
     backup_rollout_file(path, codex_home, backup_root)
-    rewritten_text = "\n".join(rewritten_lines)
+    rewritten_text = newline.join(rewritten_lines)
     if newline_at_end:
-        rewritten_text += "\n"
-    write_text_atomic(path, rewritten_text)
+        rewritten_text += newline
+    write_text_atomic(path, rewritten_text, bom=has_bom)
     report.files_updated += 1
 
 
