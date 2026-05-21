@@ -691,23 +691,18 @@ def build_where_clause(
     source_providers: Optional[set[str]],
     keep_providers: set[str],
     session_ids: Optional[set[str]],
-    force_session_ids: Optional[set[str]] = None,
     use_temp_session_table: bool = False,
 ) -> tuple[str, list[str]]:
-    base_conditions = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
-    clause_parts: list[str] = []
-    params: list[str] = []
-
-    candidate_conditions = list(base_conditions)
-    candidate_params = [target_provider]
+    candidate_conditions = ["model_provider IS NOT NULL", "model_provider != ''", "model_provider != ?"]
+    params: list[str] = [target_provider]
     if source_providers:
         placeholders = ", ".join("?" for _ in sorted(source_providers))
         candidate_conditions.append(f"model_provider IN ({placeholders})")
-        candidate_params.extend(sorted(source_providers))
+        params.extend(sorted(source_providers))
     if keep_providers:
         placeholders = ", ".join("?" for _ in sorted(keep_providers))
         candidate_conditions.append(f"model_provider NOT IN ({placeholders})")
-        candidate_params.extend(sorted(keep_providers))
+        params.extend(sorted(keep_providers))
 
     if session_ids is not None and not session_ids:
         candidate_conditions.append("1 = 0")
@@ -716,18 +711,9 @@ def build_where_clause(
     elif session_ids:
         placeholders = ", ".join("?" for _ in sorted(session_ids))
         candidate_conditions.append(f"id IN ({placeholders})")
-        candidate_params.extend(sorted(session_ids))
+        params.extend(sorted(session_ids))
 
-    clause_parts.append("(" + " AND ".join(candidate_conditions) + ")")
-    params.extend(candidate_params)
-
-    if force_session_ids:
-        force_conditions = list(base_conditions)
-        force_conditions.append("id IN (SELECT id FROM forced_session_ids)")
-        clause_parts.append("(" + " AND ".join(force_conditions) + ")")
-        params.append(target_provider)
-
-    return " OR ".join(clause_parts), params
+    return " AND ".join(candidate_conditions), params
 
 
 def simulate_sqlite_counts(
@@ -768,7 +754,6 @@ def migrate_sqlite(
     source_providers: Optional[set[str]],
     keep_providers: set[str],
     session_ids: Optional[set[str]],
-    force_session_ids: Optional[set[str]],
     apply: bool,
     backup_root: Optional[Path],
 ) -> SqliteReport:
@@ -785,15 +770,11 @@ def migrate_sqlite(
         if use_temp_session_table:
             populate_temp_session_table(connection, session_ids)
             connection.commit()
-        if force_session_ids:
-            populate_temp_session_table(connection, force_session_ids, table_name="forced_session_ids")
-            connection.commit()
         where_clause, params = build_where_clause(
             target_provider,
             source_providers,
             keep_providers,
             session_ids,
-            force_session_ids=force_session_ids,
             use_temp_session_table=use_temp_session_table,
         )
         matching_provider_counts_before = fetch_sqlite_provider_counts(connection, where_clause, params)
@@ -936,6 +917,11 @@ def main() -> int:
                 missing_label = ", ".join(sorted(missing_session_ids))
                 raise SystemExit(f"Requested --session-id values were not found in rollout history: {missing_label}")
         existing_sqlite_providers = fetch_existing_thread_providers(state_db_path, rollout_report.matched_session_ids)
+        if session_ids is not None:
+            missing_selected_sqlite_ids = rollout_report.matched_session_ids - set(existing_sqlite_providers)
+            if missing_selected_sqlite_ids:
+                missing_selected_label = ", ".join(sorted(missing_selected_sqlite_ids))
+                raise SystemExit(f"Selected rollout sessions are missing from SQLite threads: {missing_selected_label}")
         sqlite_session_ids = set(rollout_report.candidate_session_ids)
         stale_target_sqlite_ids = {
             session_id
@@ -943,6 +929,7 @@ def main() -> int:
             if rollout_provider == target_provider
             and session_id in existing_sqlite_providers
             and existing_sqlite_providers[session_id] != target_provider
+            and should_migrate(existing_sqlite_providers[session_id], target_provider, keep_providers, source_providers)
         }
         sqlite_session_ids.update(stale_target_sqlite_ids)
         missing_sqlite_ids = rollout_report.candidate_session_ids - set(existing_sqlite_providers)
@@ -955,7 +942,6 @@ def main() -> int:
             source_providers=source_providers,
             keep_providers=keep_providers,
             session_ids=sqlite_session_ids,
-            force_session_ids=stale_target_sqlite_ids,
             apply=args.apply,
             backup_root=backup_root,
         )

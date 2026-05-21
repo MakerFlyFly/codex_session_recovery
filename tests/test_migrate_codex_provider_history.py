@@ -148,6 +148,16 @@ class MigratorCliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Requested --session-id values were not found", result.stdout + result.stderr)
 
+    def test_selected_target_provider_rollout_missing_sqlite_row_fails(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-a", "OpenAI")
+        self.make_threads_db(codex_home / "state_1.sqlite")
+
+        result = self.run_cli("--codex-home", str(codex_home), "--session-id", "sess-a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Selected rollout sessions are missing from SQLite threads", result.stdout + result.stderr)
+
     def test_rollout_present_but_sqlite_row_missing_fails(self) -> None:
         codex_home = self.make_codex_home()
         self.write_config(codex_home, 'model_provider = "OpenAI"\n')
@@ -187,19 +197,37 @@ class MigratorCliTest(unittest.TestCase):
         self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
         db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "legacy-b")])
 
-        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-a", check=True)
+        dry_run = self.run_cli("--codex-home", str(codex_home), "--source-provider", "legacy-b", check=True)
         self.assertIn("- rows considered: 1", dry_run.stdout)
 
         self.run_cli(
             "--codex-home",
             str(codex_home),
             "--source-provider",
-            "legacy-a",
+            "legacy-b",
             "--apply",
             "--allow-live-codex",
             check=True,
         )
         self.assertEqual(self.fetch_provider(db_path, "sess-target"), "OpenAI")
+
+    def test_keep_provider_blocks_stale_target_sqlite_repair(self) -> None:
+        codex_home = self.make_codex_home()
+        self.write_config(codex_home, 'model_provider = "OpenAI"\n')
+        self.write_rollout(codex_home, "sess-target", "OpenAI", relpath="sessions/target.jsonl")
+        db_path = self.make_threads_db(codex_home / "state_1.sqlite", [("sess-target", "legacy-b")])
+
+        result = self.run_cli(
+            "--codex-home",
+            str(codex_home),
+            "--source-provider",
+            "legacy-b",
+            "--keep-provider",
+            "legacy-b",
+            check=True,
+        )
+        self.assertIn("- rows considered: 0", result.stdout)
+        self.assertEqual(self.fetch_provider(db_path, "sess-target"), "legacy-b")
 
     def test_rollout_missing_session_id_fails(self) -> None:
         codex_home = self.make_codex_home()
@@ -271,7 +299,6 @@ class MigratorCliTest(unittest.TestCase):
             source_providers={"old"},
             keep_providers={"OpenAI"},
             session_ids=session_ids,
-            force_session_ids=None,
             apply=False,
             backup_root=None,
         )
