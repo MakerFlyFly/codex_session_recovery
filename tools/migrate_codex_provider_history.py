@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Optional, Union
 
 
+APP_NAME = "codex_session_recovery"
+APP_DESCRIPTION = (
+    "Codex history recovery assistant: align rollout JSONL and SQLite thread "
+    "records after a model_provider change."
+)
+
+
 @dataclass
 class ConfigStatus:
     path: Path
@@ -57,10 +64,8 @@ BACKUP_ROOT_MARKER = ".codex-provider-history-backup"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Migrate Codex rollout and sqlite thread history into the current "
-            "model_provider so hidden threads become visible again in the client."
-        )
+        prog=APP_NAME,
+        description=APP_DESCRIPTION,
     )
     parser.add_argument(
         "--codex-home",
@@ -856,6 +861,9 @@ def print_summary(
     backup_root: Optional[Path],
 ) -> None:
     mode = "apply" if apply else "dry-run"
+    print(APP_NAME)
+    print("Codex history recovery assistant")
+    print("=" * 34)
     print(f"Mode: {mode}")
     print(f"Codex Home: {codex_home}")
     print(f"Target provider: {target_provider}")
