@@ -1,147 +1,226 @@
-# Codex Session Dialog Recovery
-# Codex 会话对话恢复工具
+# codex_session_recovery
 
-## What This Fixes / 这个工具解决什么问题
+<div align="center">
+  <b>Codex history recovery assistant</b><br />
+  <sub>Codex历史会话回复助手</sub>
+  <br /><br />
+  <a href="https://www.python.org/"><img alt="Python 3.9+" src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white" /></a>
+  <a href="https://github.com/MakerFlyFly/codex-session-dialog-recovery/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/MakerFlyFly/codex-session-dialog-recovery/actions/workflows/tests.yml/badge.svg" /></a>
+  <img alt="Dry-run first" src="https://img.shields.io/badge/safety-dry--run%20first-16A34A?style=flat-square" />
+  <br /><br />
+  <b>Recover hidden Codex Desktop conversations after a model_provider change.</b>
+</div>
 
-Codex Desktop can hide old chat history after `model_provider` changes. This
-tool repairs the history index by aligning rollout JSONL session metadata and
-SQLite thread records to the active provider bucket.
+<div align="center">
+  🌏 <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.md"><b>English</b></a>
+</div>
 
-当 Codex Desktop 的 `model_provider` 发生变化后，旧会话历史可能会在客户端中消失。
-这个工具会把 rollout JSONL 中的会话元数据和 SQLite 线程记录对齐到当前正在使用的
-provider bucket，让历史重新在客户端显示出来。
+<details>
+<summary><b>Terminal preview</b></summary>
 
-## What It Touches / 它会处理哪些数据
+~~~text
+$ python tools/migrate_codex_provider_history.py --source-provider codex
 
-Supported Codex Desktop layout:
+Mode: dry-run
+Target provider: OpenAI
+State DB: C:\Users\you\.codex\state_1.sqlite
 
-- `config.toml`
-- `sessions/`
-- `archived_sessions/`
-- `state_*.sqlite`
+Rollouts
+- files scanned: 42
+- session_meta matched: 17
+- session_meta rewritten: 17
 
-It assumes each rollout file contains exactly one thread, and that
-`session_meta` is the first non-empty line in the file.
+SQLite
+- rows considered: 17
+- rows updated: 0
 
-支持的 Codex Desktop 数据结构：
+Dry-run only. Re-run with --apply to write changes.
+~~~
 
-- `config.toml`
-- `sessions/`
-- `archived_sessions/`
-- `state_*.sqlite`
+</details>
 
-它假设每个 rollout 文件只对应一个线程，且 `session_meta` 是文件中的第一条非空记录。
+## Contents
 
-## Safety Model / 安全模型
+- [Why this exists](#why-this-exists)
+- [Features](#features)
+- [Two safe workflows](#two-safe-workflows)
+- [What it touches](#what-it-touches)
+- [CLI usage](#cli-usage)
+- [Safety model](#safety-model)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Privacy](#privacy)
 
-- Dry-run is the default; nothing is written unless `--apply` is provided.
-- The script validates rollout files, SQLite snapshots, backup metadata, and
-  scope alignment before writing.
-- For sessions it actively migrates or explicitly repairs, rollout JSONL and
-  SQLite must stay aligned; otherwise the script fails instead of completing a
-  one-sided migration.
-- Failed apply runs keep rollback data and print the retained backup path to
-  stderr when snapshots actually exist.
+## Why this exists
 
-- 默认是 dry-run；只有加上 `--apply` 才会真正写入。
-- 脚本会在写入前校验 rollout 文件、SQLite 快照、备份元数据，以及迁移作用域是否一致。
-- 对于脚本实际迁移或显式修复的会话，rollout JSONL 与 SQLite 必须保持对齐；若无法保证，
-  脚本会直接失败，而不是留下单边迁移结果。
-- `--apply` 失败时，只要确实生成了回滚快照，就会在 stderr 中打印保留的备份路径。
+Codex Desktop groups conversations by `model_provider`. After a provider change, old conversations can remain on disk while disappearing from the client.
 
-## Requirements / 运行要求
+`codex_session_recovery` repairs that index by aligning:
 
-- Python 3.9+
-- A normal Codex Desktop home directory
+- `session_meta` records in rollout JSONL files
+- matching `threads.model_provider` values in the Codex SQLite state database
 
-- Python 3.9 及以上
-- 标准的 Codex Desktop 数据目录
+The tool is intentionally conservative: dry-run is the default, writes require `--apply`, and rollout/SQLite scope must stay aligned.
 
-## Recommended Workflow / 推荐使用流程
+## Features
 
-1. Close Codex Desktop.
-2. Run a dry-run first and inspect the summary.
-3. Re-run with `--apply` only when the target provider and counts look correct.
-4. If `--apply` fails, inspect the rollback warnings and retained backup path
-   before retrying.
+| Capability | What it does |
+| --- | --- |
+| Dry-run first | Shows the planned scope and provider counts without writing |
+| Two-store alignment | Updates rollout JSONL and SQLite thread records together |
+| Scope control | Filter by source provider, keep provider, or specific session IDs |
+| Pre-write validation | Checks rollout structure, SQLite state, backup metadata, and scope |
+| Rollback protection | Keeps rollback data when an apply run fails after snapshots exist |
+| Standard-library only | Runs with Python 3.9+ without third-party runtime dependencies |
 
-1. 先关闭 Codex Desktop。
-2. 先跑 dry-run，看摘要输出是否符合预期。
-3. 确认目标 provider 和统计结果没问题后，再执行 `--apply`。
-4. 如果 `--apply` 失败，先查看 stderr 中的回滚警告和备份路径，再决定是否重试。
+## Two safe workflows
 
-## Usage / 使用方式
+### Workflow A — Give the project to Codex
 
-Dry-run with the default Codex home:
+Copy this prompt into a Codex session that has access to this repository:
 
-```powershell
+~~~text
+Help me recover hidden Codex Desktop conversation history with this repository.
+
+Safety requirements:
+1. Inspect the repository README and the Codex data layout before running anything.
+2. Identify the correct CODEX_HOME, config.toml, rollout directories, and state_*.sqlite.
+3. Run a dry-run first and show the target provider, source providers, matched session count,
+   and the exact command you would run next.
+4. Do not read, print, upload, or modify auth.json, API keys, tokens, or unrelated files.
+5. Do not use --allow-live-codex.
+6. Do not use --apply until I confirm the dry-run result and close Codex Desktop.
+7. If apply fails, report the rollback warning and retained backup path.
+
+Use tools/migrate_codex_provider_history.py and ask me before any write.
+~~~
+
+Codex should inspect and preview first. The `--apply` step must happen only after Codex Desktop is closed and the dry-run summary has been reviewed.
+
+### Workflow B — Follow the safe manual process
+
+1. Close Codex Desktop completely.
+2. Run a dry-run and inspect the target provider and counts.
+3. Confirm that the matched sessions are the ones you want to recover.
+4. Re-run with `--apply` to write both stores.
+5. If apply fails, inspect the rollback warning and retained backup path before retrying.
+
+~~~mermaid
+flowchart TD
+    A[Inspect Codex data] --> B[Run dry-run]
+    B --> C{Target and counts correct?}
+    C -- No --> D[Adjust scope or stop]
+    C -- Yes --> E[Close Codex and create backup]
+    E --> F[Apply JSONL + SQLite changes]
+    F --> G{Both stores aligned?}
+    G -- Yes --> H[Review final summary]
+    G -- No --> I[Restore from rollback backup]
+~~~
+
+Start with the smallest safe scope:
+
+~~~powershell
 python tools/migrate_codex_provider_history.py --source-provider codex
-```
+~~~
 
-使用默认 Codex Home 先做 dry-run：
+After reviewing the dry-run:
 
-```powershell
+~~~powershell
+python tools/migrate_codex_provider_history.py --codex-home "D:\portable\.codex" --source-provider codex --apply
+~~~
+
+## What it touches
+
+| Path | Purpose |
+| --- | --- |
+| `config.toml` | Reads the active `model_provider` and optional SQLite location |
+| `sessions/` | Reads rollout JSONL session records |
+| `archived_sessions/` | Reads archived rollout JSONL session records |
+| `state_*.sqlite` | Updates `threads.model_provider` for the matched sessions |
+
+The tool assumes that each rollout file contains exactly one thread and that `session_meta` is the first non-empty record.
+
+## CLI usage
+
+### Recover selected providers
+
+~~~powershell
 python tools/migrate_codex_provider_history.py --source-provider codex
-```
+~~~
 
-Apply against a specific Codex home:
+Repeat `--source-provider` to include multiple providers. If omitted, every non-target provider is eligible.
 
-```powershell
-python tools/migrate_codex_provider_history.py `
-  --codex-home "D:\portable\.codex" `
-  --source-provider codex `
-  --apply
-```
+### Recover one session
 
-指定某个 Codex Home 执行真正迁移：
+~~~powershell
+python tools/migrate_codex_provider_history.py --source-provider codex --session-id 019e45c7-f6ae-7971-bc68-6798d5f2b164
+~~~
 
-```powershell
-python tools/migrate_codex_provider_history.py `
-  --codex-home "D:\portable\.codex" `
-  --source-provider codex `
-  --apply
-```
+Add `--apply` only after reviewing the dry-run.
 
-Migrate one known session only:
+### Common options
 
-```powershell
-python tools/migrate_codex_provider_history.py `
-  --source-provider codex `
-  --session-id 019e45c7-f6ae-7971-bc68-6798d5f2b164 `
-  --apply
-```
+| Option | Description |
+| --- | --- |
+| `--codex-home PATH` | Codex data directory; defaults to `CODEX_HOME` or `~/.codex` |
+| `--target-provider NAME` | Provider to migrate into; defaults to `config.toml` |
+| `--source-provider NAME` | Provider to migrate; repeatable |
+| `--keep-provider NAME` | Provider key to leave untouched; repeatable |
+| `--session-id ID` | Restrict the migration to selected sessions; repeatable |
+| `--state-db PATH` | Explicit `state_*.sqlite` path |
+| `--backup-dir PATH` | Directory for pre-write backups |
+| `--apply` | Write changes; without it the command is a dry-run |
+| `--allow-live-codex` | Override the live-process guard; use only when you accept the risk |
 
-只迁移某一个已知会话：
+## Safety model
 
-```powershell
-python tools/migrate_codex_provider_history.py `
-  --source-provider codex `
-  --session-id 019e45c7-f6ae-7971-bc68-6798d5f2b164 `
-  --apply
-```
+- Dry-run is the default. Nothing is written without `--apply`.
+- The target provider defaults to the active `model_provider` in `config.toml`.
+- Before writing, the script validates rollout metadata, SQLite state, backup metadata, and migration scope.
+- For selected sessions, rollout JSONL and SQLite records must remain aligned; one-sided migration is rejected.
+- Apply is refused when a live Codex process is detected unless `--allow-live-codex` is explicitly passed.
+- Failed apply runs retain rollback data when snapshots exist and print the path to stderr.
+- Keep backups outside the repository, or use a directory already ignored by Git.
 
-## Notes / 补充说明
+## Troubleshooting
 
-- `--target-provider` defaults to the active `model_provider` in `config.toml`.
-- `--backup-dir` stores run-specific backups under a `run-<id>` subdirectory.
-- If you point `--backup-dir` into a repository, prefer a path that is already
-  ignored by Git, or keep it outside the repository entirely.
-- If `--backup-dir` is omitted, failed apply runs store rollback data in a
-  system temporary directory.
-- `--allow-live-codex` is an escape hatch only; the intended workflow is still
-  to close Codex before `--apply`.
+| Symptom | What to check |
+| --- | --- |
+| `Could not determine target provider` | Add `--target-provider NAME` or verify `config.toml` has a top-level `model_provider` |
+| `State DB not found` during apply | Check `sqlite_home`, `CODEX_SQLITE_HOME`, or pass `--state-db PATH`; apply refuses rollout-only changes |
+| `Live Codex process detected` | Close Codex Desktop and retry; `--allow-live-codex` is an explicit risk override |
+| A requested session ID was not found | Confirm `--codex-home`, the session ID, and both `sessions/` and `archived_sessions/` |
+| Apply reports a rollback path | Do not delete it; inspect the warning and retained backup before another attempt |
+| The summary shows zero matches | Run dry-run without restrictive filters, then narrow the source/provider/session scope |
 
-- `--target-provider` 默认取 `config.toml` 里的当前 `model_provider`。
-- `--backup-dir` 会把每次运行的备份放到 `run-<id>` 子目录下。
-- 如果把 `--backup-dir` 指到仓库里，最好使用已经被 Git 忽略的目录，或者直接放在仓库外。
-- 如果不传 `--backup-dir`，失败的 apply 会把回滚数据放到系统临时目录中。
-- `--allow-live-codex` 只是兜底开关，推荐流程仍然是在关闭 Codex 后再执行 `--apply`。
+## Development
 
-## Privacy / 隐私提醒
+Runtime code uses only the Python standard library. Run the test suite locally:
 
-Do not publish personal Codex history, backup folders, SQLite databases,
-`auth.json`, API keys, tokens, or any other local desktop secrets together with
-this tool.
+~~~powershell
+python -m unittest discover -s tests -v
+~~~
 
-不要把个人 Codex 历史、备份目录、SQLite 数据库、`auth.json`、API key、token
-或任何本地桌面环境里的私密内容和这个工具一起发布。
+Additional checks:
+
+~~~powershell
+python -m py_compile tools/migrate_codex_provider_history.py
+python tools/migrate_codex_provider_history.py --help
+~~~
+
+The project keeps the existing entry point at `tools/migrate_codex_provider_history.py` for compatibility.
+
+## Contributing and support
+
+Before opening an issue:
+
+1. Reproduce the problem with a dry-run.
+2. Remove personal paths, session content, database files, and credentials from the report.
+3. Include the Python version, operating system, sanitized command, and relevant error text.
+4. Run the test suite and include the result.
+
+The repository currently does not declare a license. Do not add a license badge or assume redistribution terms without maintainer confirmation.
+
+## Privacy
+
+Never publish personal Codex history, backup folders, SQLite databases, `auth.json`, API keys, tokens, or other local desktop secrets with this project.
