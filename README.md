@@ -2,7 +2,7 @@
 
 <div align="center">
   <b>Codex history recovery assistant</b><br />
-  <sub>Codex历史会话回复助手</sub>
+  <sub>Codex历史会话恢复助手</sub>
   <br /><br />
   <a href="https://www.python.org/"><img alt="Python 3.9+" src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white" /></a>
   <a href="https://github.com/MakerFlyFly/codex-session-dialog-recovery/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/MakerFlyFly/codex-session-dialog-recovery/actions/workflows/tests.yml/badge.svg" /></a>
